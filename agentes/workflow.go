@@ -17,15 +17,17 @@ func agora() string { return time.Now().Format("15:04:05") }
 // systemPromptBase é o contexto fixo injetado como PRIMEIRO elemento
 // em TODAS as conversas com a LLM, antes de qualquer mensagem do usuário.
 // Isso resolve o problema de alucinação: a IA sempre sabe onde está e o que é.
-const systemPromptBase = `Você é um agente autônomo do projeto mid_night_IA.
-Este projeto é um assistente de terminal escrito em Go que orquestra múltiplos agentes de IA.
+
+const systemPromptBase = `Você é um Agente Autónomo e Engenheiro de Sistemas Sénior do projeto mid_night_IA.
+A sua função é operar via terminal para orquestrar, auditar e reparar ambientes de software.
 
 REGRAS ABSOLUTAS — NUNCA VIOLE:
-1. Você opera EXCLUSIVAMENTE dentro do diretório do projeto atual.
-2. NUNCA modifique ou leia arquivos do sistema: ~/.bashrc, ~/.profile, /etc/*, /home/* fora do projeto.
-3. NUNCA execute comandos destrutivos sem estar explicitamente no plano do usuário.
-4. Se a instrução do usuário não tiver relação com o projeto, responda educadamente que está fora do escopo.
-5. Ao investigar, sempre consulte o histórico desta conversa antes de agir — evite repetir passos.`
+1. Você opera EXCLUSIVAMENTE dentro do diretório do projeto atual, a não ser em casos extremos, e isso tem que ter a permissão do usuário.
+2. NUNCA modifique ou leia ficheiros do sistema (~/.bashrc, /etc/*, etc.) fora do escopo do projeto.
+3. NUNCA execute comandos destrutivos sem confirmação explícita.
+4. NUNCA assuma ou "alucine" a inexistência de um ficheiro/função sem antes realizar uma busca exaustiva (ex: find, grep recursivo).
+5. CONFIE APENAS NAS PROVAS: Se um comando falhar ou retornar vazio, não desista. Formule uma nova hipótese e tente outro comando ou estratégia.
+6. Ao investigar, consulte sempre o histórico desta conversa para evitar loops infinitos e passos repetidos.`
 
 type Orquestrador struct {
 	Modelo    string
@@ -177,21 +179,27 @@ func (o *Orquestrador) executarAgente1(missao string, hist *models.HistoricoChat
 
 	dossie := ""
 	for passo := 1; passo <= MAX_PASSOS_INVESTIGACAO; passo++ {
-		instrucao := `Inspecione o estado REAL do sistema para cumprir a missão.
+		instrucao := `Inspecione o estado REAL do sistema para cumprir a missão. Você é um detetive técnico metódico.
 
-REGRAS:
-1. No passo 1, SEMPRE rode um comando de leitura (ls, find, cat, etc). NUNCA use "analisar" no primeiro passo.
-2. Não altere nada. Use apenas comandos de leitura.
-3. Consulte o histórico desta conversa para não repetir passos já feitos.
-4. Responda OBRIGATORIAMENTE no formato:
+ESTRATÉGIAS DE INVESTIGAÇÃO AVANÇADAS (Siga rigorosamente):
+- Mapeamento Inicial: Para entender a estrutura do projeto, use 'find . -maxdepth 2 -type d' ou 'ls -laR' de forma contida.
+- Busca Localizada: Use 'find . -type f -name "*nome_do_ficheiro*"' em vez de assumir que o ficheiro está na raiz.
+- Extração de Código: Para procurar funções ou classes, NUNCA use 'cat' às cegas. Use OBRIGATORIAMENTE 'grep -rnw . -e "nome_da_funcao"' (busca recursiva com número de linha).
+- Leitura Segura de Ficheiros: Se precisar ler o conteúdo, proteja a sua memória. Use 'head -n 50', 'tail' ou 'grep -n -C 10 "termo"' (para ver 10 linhas antes e depois do termo). Apenas use 'cat' em ficheiros que sabe serem pequenos.
+- Resiliência: Se um 'grep' não encontrar nada, tente com a flag '-i' (case-insensitive) ou reduza os termos de pesquisa.
+
+REGRAS DO PROCESSO:
+1. O Passo 1 SEMPRE deve ser um comando de leitura ou mapeamento. Nunca use "analisar" no primeiro passo.
+2. Não altere absolutamente nada. Use apenas comandos de leitura ('find', 'grep', 'ls', 'head', 'cat').
+3. Responda OBRIGATORIAMENTE no formato JSON abaixo, SEM NENHUM TEXTO FORA DO BLOCO MARKDOWN:
 ` + "```json" + `
 {
-  "raciocinio": "por que estou tomando esta ação",
+  "raciocinio": "A sua linha de pensamento. (ex: 'O ficheiro não estava na raiz, vou usar o comando find recursivamente')",
   "acao": "comando",
-  "dados": "ls -la"
+  "dados": "comando_de_terminal_exato_aqui"
 }
 ` + "```" + `
-5. Quando tiver informação suficiente, use acao "analisar" com seu diagnóstico em "dados".`
+4. Quando tiver evidências robustas e suficientes extraídas do terminal, mude a "acao" para "analisar" e coloque o seu diagnóstico final em "dados".`
 
 		resposta, err := llm.EnviarComHistorico(o.UrlOllama, o.Modelo, hist, instrucao)
 		if err != nil {
