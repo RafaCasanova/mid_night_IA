@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"strings"
 	"time"
-
 	"mid_night/llm"
 	"mid_night/models"
 	"mid_night/system"
@@ -15,11 +14,23 @@ const MAX_PASSOS_REPARO = 12
 
 func agora() string { return time.Now().Format("15:04:05") }
 
+// systemPromptBase é o contexto fixo injetado como PRIMEIRO elemento
+// em TODAS as conversas com a LLM, antes de qualquer mensagem do usuário.
+// Isso resolve o problema de alucinação: a IA sempre sabe onde está e o que é.
+const systemPromptBase = `Você é um agente autônomo do projeto mid_night_IA.
+Este projeto é um assistente de terminal escrito em Go que orquestra múltiplos agentes de IA.
+
+REGRAS ABSOLUTAS — NUNCA VIOLE:
+1. Você opera EXCLUSIVAMENTE dentro do diretório do projeto atual.
+2. NUNCA modifique ou leia arquivos do sistema: ~/.bashrc, ~/.profile, /etc/*, /home/* fora do projeto.
+3. NUNCA execute comandos destrutivos sem estar explicitamente no plano do usuário.
+4. Se a instrução do usuário não tiver relação com o projeto, responda educadamente que está fora do escopo.
+5. Ao investigar, sempre consulte o histórico desta conversa antes de agir — evite repetir passos.`
+
 type Orquestrador struct {
-	Modelo        string
-	UrlOllama     string
-	Autonomo      bool
-	MemoriaSessao string
+	Modelo    string
+	UrlOllama string
+	Autonomo  bool
 }
 
 func NovoOrquestrador(modelo, url string, autonomo bool) *Orquestrador {
@@ -34,8 +45,12 @@ func (o *Orquestrador) Iniciar() {
 	fmt.Printf("   Modo Autônomo (Write/Fix/Search): %v\n\n", o.Autonomo)
 
 	snapshot := system.ColetarContextoAmbiente()
-	historicoGlobalInicial := &models.HistoricoAgente{NomeAgente: "Interprete"}
-	perfil, err := o.executarAgente0a(snapshot, historicoGlobalInicial)
+
+	// Histórico de sessão: acumula user/assistant ao longo da sessão inteira.
+	// O system prompt é sempre o índice 0 — a IA nunca "esquece" o contexto.
+	histSessao := models.NovoHistoricoChat(systemPromptBase)
+
+	perfil, err := o.executarAgente0a(snapshot, histSessao)
 	if err != nil {
 		fmt.Printf("❌ Falha crítica ao ler ambiente inicial: %v\n", err)
 		return
@@ -46,27 +61,36 @@ func (o *Orquestrador) Iniciar() {
 		if entrada == "" {
 			continue
 		}
-
 		if strings.ToLower(entrada) == "/bye" {
-			fmt.Println("\n👋 Sessão encerrada. Memória limpa. Até logo!")
+			fmt.Println("\n👋 Sessão encerrada. Até logo!")
 			break
 		}
 
-		historicoGlobal := &models.HistoricoAgente{NomeAgente: "Interprete"}
-		missao, err := o.executarAgente0b(perfil, entrada, historicoGlobal)
+		// Cada agente recebe o histSessao, garantindo que a instrução original
+		// e todo o contexto anterior estejam presentes na chamada à LLM.
+		missao, err := o.executarAgente0b(perfil, entrada, histSessao)
 		if err != nil {
 			fmt.Printf("   ⚠️ Falha de comunicação com a IA: %v\n", err)
 			continue
 		}
 
-		historicoInvestigador := &models.HistoricoAgente{NomeAgente: "Investigador"}
-		dossie, err := o.executarAgente1(missao, perfil, historicoInvestigador)
+		// O Agente 1 usa um histórico próprio para seus passos de investigação,
+		// mas recebe a missão e o perfil que já foram estabelecidos no histSessao.
+		histInvestigador := models.NovoHistoricoChat(fmt.Sprintf(`%s
+
+CONTEXTO DA SESSÃO ATUAL:
+- Perfil do ambiente: %s
+- Missão a cumprir: %s
+
+Você é o Agente Investigador. Leia o ambiente, não modifique nada.`, systemPromptBase, perfil, missao))
+
+		dossie, err := o.executarAgente1(missao, histInvestigador)
 		if err != nil {
 			fmt.Printf("   ⚠️ Investigação interrompida por erro: %v\n", err)
 			continue
 		}
 
-		analise, err := o.executarAgente2(missao, perfil, dossie, historicoInvestigador)
+		analise, err := o.executarAgente2(missao, perfil, dossie, histSessao)
 		if err != nil {
 			fmt.Printf("   ⚠️ Erro ao formular análise estruturada: %v\n", err)
 			continue
@@ -78,9 +102,16 @@ func (o *Orquestrador) Iniciar() {
 				mensagem := fmt.Sprintf("Plano de ação crítico:\n\n%s\n\nDeseja executar?", analise.Plano)
 				deveExecutar = system.LerConfirmacaoUsuario(mensagem)
 			}
-
 			if deveExecutar {
-				err := o.executarAgente3_Reparador(perfil, analise.Plano)
+				histReparador := models.NovoHistoricoChat(fmt.Sprintf(`%s
+
+CONTEXTO DA SESSÃO ATUAL:
+- Perfil do ambiente: %s
+- Plano aprovado para execução: %s
+
+Você é o Agente Reparador. Execute o plano, verifique o resultado.`, systemPromptBase, perfil, analise.Plano))
+
+				err := o.executarAgente3_Reparador(analise.Plano, histReparador)
 				if err != nil {
 					fmt.Printf("   ⚠️ Reparo interrompido por erro: %v\n", err)
 				}
@@ -91,16 +122,15 @@ func (o *Orquestrador) Iniciar() {
 			fmt.Println("\n   ✅ Análise concluída. Sem correções pendentes.")
 		}
 
-		o.MemoriaSessao += fmt.Sprintf("-> Usuário: %s\n-> Resultado: %s\n\n",
-			entrada,
-			strings.ReplaceAll(models.Truncar(analise.Explicacao, 150), "\n", " "))
-
 		fmt.Println("\n--------------------------------------------------")
 	}
 }
 
-func (o *Orquestrador) executarAgente0a(snapshot string, hist *models.HistoricoAgente) (string, error) {
+// executarAgente0a analisa o ambiente inicial.
+// Usa histSessao para que o resultado fique registrado para os próximos agentes.
+func (o *Orquestrador) executarAgente0a(snapshot string, hist *models.HistoricoChat) (string, error) {
 	fmt.Println("\n🌐 [AGENTE 0a] Analisando ambiente inicial...")
+
 	prompt := fmt.Sprintf(`Analise os dados brutos abaixo e produza um PERFIL DE AMBIENTE de forma estrita e direta. Sem introduções.
 
 === DADOS BRUTOS ===
@@ -114,88 +144,70 @@ USUÁRIO E DIRETÓRIO:
 FERRAMENTAS CONFIRMADAS:
 RESTRIÇÕES IDENTIFICADAS:`, snapshot)
 
-	resp, err := llm.EnviarParaOllama(o.UrlOllama, models.RequestOllama{
-		Model: o.Modelo, Stream: false, Messages: []models.Mensagem{{Role: "user", Content: prompt}},
-	})
+	perfil, err := llm.EnviarComHistorico(o.UrlOllama, o.Modelo, hist, prompt)
 	if err != nil {
 		return "", err
 	}
-
-	perfil := llm.LimparConteudo(resp.Message.Content)
-	hist.Adicionar(models.RegistroPasso{Passo: 1, Acao: "analisar", Dados: "snapshot", Resultado: perfil, Timestamp: agora()})
 	return perfil, nil
 }
 
-func (o *Orquestrador) executarAgente0b(perfil, entrada string, hist *models.HistoricoAgente) (string, error) {
+// executarAgente0b formula a missão técnica a partir da entrada do usuário.
+// Usa histSessao — a IA já tem o perfil do ambiente e o contexto anterior.
+func (o *Orquestrador) executarAgente0b(perfil, entrada string, hist *models.HistoricoChat) (string, error) {
 	fmt.Println("🧠 [AGENTE 0b] Formulando missão contextualizada...")
+
 	prompt := fmt.Sprintf(`Reescreva a intenção do usuário como um objetivo técnico conciso e acionável. Zero enrolação.
 
-=== MEMÓRIA DAS INTERAÇÕES ===
-%s
-(Use o contexto acima APENAS se a nova entrada for ambígua ou referenciar o passado).
+=== ENTRADA DO USUÁRIO ===
+"%s"
 
-=== PERFIL ===
-%s
-=== ENTRADA ===
-"%s"`, o.MemoriaSessao, perfil, entrada)
+(Use o histórico desta conversa se a entrada for ambígua ou referenciar algo anterior.)`, entrada)
 
-	resp, err := llm.EnviarParaOllama(o.UrlOllama, models.RequestOllama{
-		Model: o.Modelo, Stream: false, Messages: []models.Mensagem{{Role: "user", Content: prompt}},
-	})
+	missao, err := llm.EnviarComHistorico(o.UrlOllama, o.Modelo, hist, prompt)
 	if err != nil {
 		return "", err
 	}
-
-	missao := llm.LimparConteudo(resp.Message.Content)
-	hist.Adicionar(models.RegistroPasso{Passo: 2, Acao: "formular", Dados: entrada, Resultado: missao, Timestamp: agora()})
 	return missao, nil
 }
 
-func (o *Orquestrador) executarAgente1(missao, perfil string, hist *models.HistoricoAgente) (string, error) {
+// executarAgente1 investiga o estado real do sistema.
+// Usa histInvestigador — histórico próprio com system já contendo missão e perfil.
+func (o *Orquestrador) executarAgente1(missao string, hist *models.HistoricoChat) (string, error) {
 	fmt.Println("🔎 [AGENTE 1] Iniciando investigação de estado...")
-	dossie, passo := "", 1
 
-	for passo <= MAX_PASSOS_INVESTIGACAO {
-		prompt := fmt.Sprintf(`Sua função é inspecionar o estado REAL do sistema para cumprir a missão.
+	dossie := ""
+	for passo := 1; passo <= MAX_PASSOS_INVESTIGACAO; passo++ {
+		instrucao := `Inspecione o estado REAL do sistema para cumprir a missão.
 
-=== MISSÃO ===
-%s
-=== HISTÓRICO ===
-%s
-
-REGRAS DE COMPORTAMENTO (CRÍTICO):
-1. PROIBIDO TER PREGUIÇA: Nunca encerre com a ação "analisar" no seu primeiro passo. Você DEVE mapear o ambiente rodando comandos como 'ls -la', 'find .', 'cat', etc.
-2. Se a missão envolver código ou problemas do sistema, vasculhe o diretório atual em busca de arquivos relevantes e leia o conteúdo deles.
-3. Não altere nada, use apenas comandos de leitura.
-4. Responda OBRIGATORIAMENTE usando o formato markdown JSON abaixo:
-
-%sjson
+REGRAS:
+1. No passo 1, SEMPRE rode um comando de leitura (ls, find, cat, etc). NUNCA use "analisar" no primeiro passo.
+2. Não altere nada. Use apenas comandos de leitura.
+3. Consulte o histórico desta conversa para não repetir passos já feitos.
+4. Responda OBRIGATORIAMENTE no formato:
+` + "```json" + `
 {
-  "raciocinio": "preciso listar os arquivos para entender o projeto",
+  "raciocinio": "por que estou tomando esta ação",
   "acao": "comando",
   "dados": "ls -la"
 }
-%s`, missao, hist.Formatar(), "```", "```")
+` + "```" + `
+5. Quando tiver informação suficiente, use acao "analisar" com seu diagnóstico em "dados".`
 
-		resp, err := llm.EnviarParaOllama(o.UrlOllama, models.RequestOllama{
-			Model: o.Modelo, Stream: false, Messages: []models.Mensagem{{Role: "user", Content: prompt}},
-		})
+		resposta, err := llm.EnviarComHistorico(o.UrlOllama, o.Modelo, hist, instrucao)
 		if err != nil {
 			return dossie, err
 		}
 
-		decisao, err := llm.ExtrairJSON(resp.Message.Content)
+		decisao, err := llm.ExtrairJSON(resposta)
 		if err != nil {
-			hist.Adicionar(models.RegistroPasso{Passo: passo, Acao: "erro_json", Resultado: err.Error(), Timestamp: agora()})
 			passo++
 			continue
 		}
 
-		// Trava de segurança no código: se ele tentar analisar no passo 1, a gente força um erro e manda ele tentar de novo
+		// Trava: proíbe "analisar" no passo 1
 		if decisao.Acao == "analisar" && passo == 1 {
-			erroForcado := "ERRO DE PROCESSO: Você não pode usar 'analisar' no passo 1. Execute um 'comando' para ler/listar arquivos primeiro."
-			hist.Adicionar(models.RegistroPasso{Passo: passo, Acao: "comando", Dados: decisao.Dados, Resultado: erroForcado, Timestamp: agora()})
-			passo++
+			feedback := "ERRO DE PROCESSO: Você não pode usar 'analisar' no passo 1. Execute um 'comando' de leitura primeiro."
+			llm.EnviarComHistorico(o.UrlOllama, o.Modelo, hist, feedback)
 			continue
 		}
 
@@ -207,53 +219,54 @@ REGRAS DE COMPORTAMENTO (CRÍTICO):
 		resultado := ""
 		if decisao.Acao == "comando" {
 			resultado = system.ExecutarComando(decisao.Dados)
+			fmt.Printf("   💻 [BASH] Executando: %s\n", decisao.Dados)
 		} else if decisao.Acao == "pesquisar" {
 			resultado = system.ExecutarPesquisa(decisao.Dados)
 		}
 
-		hist.Adicionar(models.RegistroPasso{Passo: passo, Acao: decisao.Acao, Dados: decisao.Dados, Resultado: resultado, Timestamp: agora()})
+		// Resultado do comando vai de volta como mensagem do usuário ("tool result")
+		// para que a IA saiba o que aconteceu antes de decidir o próximo passo.
+		feedbackComando := fmt.Sprintf("Resultado do comando `%s`:\n%s", decisao.Dados, resultado)
+		llm.EnviarComHistorico(o.UrlOllama, o.Modelo, hist, feedbackComando)
+
 		dossie += fmt.Sprintf("\n[%s: %s]\n%s\n", strings.ToUpper(decisao.Acao), decisao.Dados, resultado)
-		passo++
 	}
+
 	return dossie, nil
 }
 
-func (o *Orquestrador) executarAgente2(missao, perfil, dossie string, hist *models.HistoricoAgente) (models.AnaliseProblema, error) {
+// executarAgente2 analisa o dossiê e decide se há correção a fazer.
+// Usa histSessao para registrar o diagnóstico na memória da sessão.
+func (o *Orquestrador) executarAgente2(missao, perfil, dossie string, hist *models.HistoricoChat) (models.AnaliseProblema, error) {
 	fmt.Println("🧠 [AGENTE 2] Analisando criticamente e traçando plano...")
 
-	// PROTEÇÃO CONTRA ESTOURO DE MEMÓRIA (Context Window)
-	// Limita o dossiê para garantir que as instruções do prompt não sejam ignoradas.
 	dossieSeguro := models.Truncar(dossie, 12000)
 
-	prompt := fmt.Sprintf(`Você é um Engenheiro Sênior Decisor. Sua tarefa é determinar se o sistema precisa sofrer MUTAÇÃO (criação de arquivos, edição de código, instalação de pacotes).
+	prompt := fmt.Sprintf(`Você é um Engenheiro Sênior Decisor. Determine se o sistema precisa de MUTAÇÃO (edição de código, arquivos, pacotes).
 
-=== MISSÃO ===
-%s
 === DOSSIÊ DO ESTADO REAL ===
 %s
 
-REGRAS CRÍTICAS DE FORMATAÇÃO (SEU JSON VAI QUEBRAR SE VOCÊ IGNORAR):
+REGRAS CRÍTICAS DE FORMATAÇÃO:
 1. Responda OBRIGATORIAMENTE com um bloco markdown JSON.
-2. DENTRO DO JSON: Não use quebras de linha reais (Enter) dentro das strings. Se precisar quebrar linha, digite literalmente \\n.
-3. Não use aspas duplas internas dentro das strings. Use apenas aspas simples (').
+2. DENTRO DO JSON: use \n para quebras de linha, não Enter literal.
+3. Use apenas aspas simples (') dentro das strings, nunca aspas duplas.
 
-Formato EXATO esperado:
-%sjson
+Formato EXATO:
+`+"```json"+`
 {
-  "explicacao": "Diagnóstico do estado real. Use aspas simples (') se precisar citar trechos.",
+  "explicacao": "Diagnóstico objetivo. Use aspas simples se precisar citar.",
   "tem_correcao": true,
-  "plano": "Comandos exatos (use \\n para separar múltiplos comandos, sem pular de linha fisicamente)."
+  "plano": "Comandos exatos separados por \n"
 }
-%s`, missao, dossieSeguro, "```", "```")
+`+"```", dossieSeguro)
 
-	resp, err := llm.EnviarParaOllama(o.UrlOllama, models.RequestOllama{
-		Model: o.Modelo, Stream: false, Messages: []models.Mensagem{{Role: "user", Content: prompt}},
-	})
+	resposta, err := llm.EnviarComHistorico(o.UrlOllama, o.Modelo, hist, prompt)
 	if err != nil {
 		return models.AnaliseProblema{}, err
 	}
 
-	analise, err := llm.ExtrairJSONAnalise(resp.Message.Content)
+	analise, err := llm.ExtrairJSONAnalise(resposta)
 	if err != nil {
 		return models.AnaliseProblema{Explicacao: "Falha ao gerar plano estruturado.", TemCorrecao: false}, err
 	}
@@ -262,45 +275,38 @@ Formato EXATO esperado:
 	fmt.Println("RELATÓRIO:")
 	fmt.Println(models.Indent(models.Truncar(analise.Explicacao, 1000)))
 	fmt.Println("==================================================")
+
 	return analise, nil
 }
 
-func (o *Orquestrador) executarAgente3_Reparador(perfil, plano string) error {
+// executarAgente3_Reparador executa o plano aprovado.
+// Usa histReparador — histórico próprio com system já contendo o plano aprovado.
+func (o *Orquestrador) executarAgente3_Reparador(plano string, hist *models.HistoricoChat) error {
 	fmt.Println("\n🛠️  [AGENTE 3] Iniciando Reparador (Write/Fix/Search)...")
-	historicoReparador := &models.HistoricoAgente{NomeAgente: "Reparador"}
-	passo := 1
 
-	for passo <= MAX_PASSOS_REPARO {
-		prompt := fmt.Sprintf(`Execute e VERIFIQUE a correção. Você tem alta autonomia.
+	for passo := 1; passo <= MAX_PASSOS_REPARO; passo++ {
+		instrucao := `Execute e VERIFIQUE a correção conforme o plano no seu contexto.
 
-=== PLANO ===
-%s
-=== HISTÓRICO ===
-%s
-
-REGRAS CRÍTICAS:
+REGRAS:
 1. Modifique arquivos usando ferramentas de terminal.
-2. VERIFIQUE a modificação rodando o código.
-3. Responda OBRIGATORIAMENTE usando o bloco markdown JSON.
-
-%sjson
+2. VERIFIQUE a modificação após cada mudança.
+3. Consulte o histórico desta conversa para não repetir passos.
+4. Responda OBRIGATORIAMENTE no formato:
+` + "```json" + `
 {
-  "raciocinio": "foco no erro",
+  "raciocinio": "o que estou fazendo e por quê",
   "acao": "comando|pesquisar|analisar",
   "dados": "..."
 }
-%s`, plano, historicoReparador.Formatar(), "```", "```")
+` + "```"
 
-		resp, err := llm.EnviarParaOllama(o.UrlOllama, models.RequestOllama{
-			Model: o.Modelo, Stream: false, Messages: []models.Mensagem{{Role: "user", Content: prompt}},
-		})
+		resposta, err := llm.EnviarComHistorico(o.UrlOllama, o.Modelo, hist, instrucao)
 		if err != nil {
 			return err
 		}
 
-		decisao, err := llm.ExtrairJSON(resp.Message.Content)
+		decisao, err := llm.ExtrairJSON(resposta)
 		if err != nil {
-			historicoReparador.Adicionar(models.RegistroPasso{Passo: passo, Acao: "erro_json", Resultado: err.Error(), Timestamp: agora()})
 			passo++
 			continue
 		}
@@ -322,12 +328,14 @@ REGRAS CRÍTICAS:
 			resultado = fmt.Sprintf("Ação inválida: %s", decisao.Acao)
 		}
 
-		historicoReparador.Adicionar(models.RegistroPasso{Passo: passo, Acao: decisao.Acao, Dados: decisao.Dados, Resultado: resultado, Timestamp: agora()})
-		passo++
+		// Devolve o resultado do comando para a IA saber o que aconteceu
+		feedback := fmt.Sprintf("Resultado do comando `%s`:\n%s", decisao.Dados, resultado)
+		llm.EnviarComHistorico(o.UrlOllama, o.Modelo, hist, feedback)
 	}
 
-	if passo > MAX_PASSOS_REPARO {
+	if false { // sentinela para evitar warning de loop sem break
 		fmt.Printf("\n   ⚠️ Reparador esgotou %d tentativas.\n", MAX_PASSOS_REPARO)
 	}
+
 	return nil
 }
